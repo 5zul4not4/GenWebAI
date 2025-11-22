@@ -1,0 +1,35 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper function to check if a user is authenticated
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    // Helper function to check if the requester owns the document
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+
+    match /users/{userId} {
+      // Users can only read, create, update their own profile
+      allow get, update: if isSignedIn() && isOwner(userId);
+      // New user documents can be created if the user is signed in and the document ID matches their UID.
+      allow create: if isSignedIn() && isOwner(userId);
+      
+      // Deny deleting user profiles for now to prevent accidental data loss.
+      allow delete: if false;
+      // Disallow listing all users.
+      allow list: if false;
+
+      match /projects/{projectId} {
+        // A user can perform any action on their own projects.
+        allow read, write, delete: if isSignedIn() && isOwner(userId);
+        
+        // A user can only list their own projects.
+        allow list: if isSignedIn() && isOwner(userId);
+      }
+    }
+  }
+}
