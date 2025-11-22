@@ -104,7 +104,7 @@ const generateFullProjectPrompt = ai.definePrompt({
       *   Give it a nickname and register the app.
       *   Firebase will give you a \`firebaseConfig\` object. You will need this for the next step.
 
-  ## Step 2: Configure the Application
+  ## Step 2: Configure the Application for Local Development
 
   1.  **Create an Environment File:** In the root of this project, create a new file named \`.env.local\`.
   2.  **Add Firebase Credentials:** Paste the keys from your Firebase config object into the \`.env.local\` file like this:
@@ -129,6 +129,37 @@ const generateFullProjectPrompt = ai.definePrompt({
       npm run dev
       \`\`\`
   3.  Open [http://localhost:3000](http://localhost:3000) in your browser to see your website!
+  
+  ---
+  
+  ## Step 4: Deployment to Vercel (or other hosts)
+  
+  When you are ready to deploy your site to a hosting provider like Vercel, you need to configure it correctly.
+
+  ### A. Configure Environment Variables
+
+  Your local \`.env.local\` file is not uploaded to GitHub for security reasons. You must add the Firebase credentials to your hosting provider's environment variable settings.
+
+  **For Vercel:**
+  1. Go to your project on Vercel and click the **Settings** tab.
+  2. Click on **Environment Variables** in the side menu.
+  3. Add each key from your \`.env.local\` file one by one. For example:
+     - Key: \`NEXT_PUBLIC_FIREBASE_API_KEY\`, Value: \`YOUR_API_KEY\`
+     - Key: \`NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN\`, Value: \`YOUR_AUTH_DOMAIN\`
+     - ...and so on for all the Firebase keys.
+  4. Redeploy your project for the new variables to take effect.
+
+  ### B. Authorize Your Live Domain for Google Sign-In
+
+  To allow users to sign in with Google on your live website, you must add your Vercel URL to Firebase's list of authorized domains.
+
+  1. **Get your Vercel URL:** After your first deployment, Vercel will give you a URL like \`your-project-name.vercel.app\`.
+  2. **Go to Firebase Console:** Open your Firebase project.
+  3. Navigate to **Authentication** -> **Settings** tab.
+  4. Under the **Authorized domains** section, click **Add domain**.
+  5. Enter your Vercel URL (e.g., \`your-project-name.vercel.app\`) and click **Add**.
+
+  Your Google Sign-In should now work correctly on your live Vercel deployment.
 
   \`\`\`
 
@@ -163,3 +194,5 @@ const generateFullProjectFlow = ai.defineFlow(
     return output!;
   }
 );
+
+    
