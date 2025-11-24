@@ -10,6 +10,6 @@ export const ai = genkit({
       apiKey: process.env.OPENAI_API_KEY,
     }),
   ],
-  model: 'openai/gpt-4.1-mini',
+  model: 'openai/gpt-4o',
 
 });
