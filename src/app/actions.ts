@@ -1,8 +1,9 @@
+
 'use server';
 
 import {generateFullProject, type GenerateFullProjectInput} from '@/ai/flows/generate-full-project';
 import type {GenerateFullProjectOutput} from '@/ai/flows/generate-full-project';
-import {generateWebsitePreview, type GenerateWebsitePreviewInput} from '@/ai/flows/generate-website-from-prompt';
+import {generateWebsitePreview, type GenerateWebsitePreviewInput, type GenerateWebsitePreviewOutput} from '@/ai/flows/generate-website-from-prompt';
 import {smartPromptAssistant} from '@/ai/flows/smart-prompt-assistant';
 import {applyLogoAwareTheming} from '@/ai/flows/apply-logo-aware-theming';
 import {regenerateWebsiteSection} from '@/ai/flows/regenerate-website-section';
@@ -28,12 +29,12 @@ export async function generateFullProjectAction(input: GenerateFullProjectInput)
 
 export async function generateWebsitePreviewAction(
   input: GenerateWebsitePreviewInput
-): Promise<{previewContent?: string; error?: string}> {
+): Promise<{preview?: GenerateWebsitePreviewOutput; error?: string}> {
   console.time('generateWebsitePreviewAction');
   try {
     const result = await generateWebsitePreview(input);
     console.timeEnd('generateWebsitePreviewAction');
-    return {previewContent: result.previewContent};
+    return {preview: result};
   } catch (e: any)
     {
     console.error(e);
