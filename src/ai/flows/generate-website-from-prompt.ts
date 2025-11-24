@@ -1,28 +1,25 @@
-
 'use server';
 /**
- * @fileOverview This file defines a Genkit flow for generating an interactive website preview from a user prompt.
- *
- * This flow is designed to create a single HTML file that is a high-fidelity mockup.
- * It uses JS to simulate multi-page navigation and includes responsive CSS.
- *
- * It exports:
- *   - generateWebsitePreview - The main function to trigger the website preview generation flow.
- *   - GenerateWebsitePreviewInput - The input type for the function.
- *   - GenerateWebsitePreviewOutput - The output type for the function.
+ * Rebuilt and hardened generate-website-from-prompt flow.
+ * - Enforces multi-file JSON manifest
+ * - Instructs model NOT to escape newlines
+ * - Post-processes returned file contents to unescape sequences
+ * - Ensures logoDataUri is included as assets/logo.png when provided
  */
 
-import {ai} from '@/ai/genkit';
-import {z} from 'genkit';
+import { ai } from '@/ai/genkit';
+import { z } from 'genkit';
 
 const GenerateWebsitePreviewInputSchema = z.object({
   prompt: z.string().describe('A detailed description of the desired website.'),
   logoDataUri: z.optional(z.string()).describe('Optional: A data URI of a logo to be included and used for theming.'),
-  theme: z.optional(z.object({
-    primaryColor: z.string(),
-    secondaryColor: z.string(),
-    accentColor: z.string(),
-  })).describe('Optional: A color theme to apply to the website.'),
+  theme: z.optional(
+    z.object({
+      primaryColor: z.string(),
+      secondaryColor: z.string(),
+      accentColor: z.string(),
+    })
+  ).describe('Optional: A color theme to apply to the website.'),
 });
 export type GenerateWebsitePreviewInput = z.infer<typeof GenerateWebsitePreviewInputSchema>;
 
@@ -38,195 +35,122 @@ const GenerateWebsitePreviewOutputSchema = z.object({
     )
     .describe('An array of file objects representing the project.'),
 });
-export type GenerateWebsitePreviewOutput = z.infer<
-  typeof GenerateWebsitePreviewOutputSchema
->;
+export type GenerateWebsitePreviewOutput = z.infer<typeof GenerateWebsitePreviewOutputSchema>;
 
-export async function generateWebsitePreview(
-  input: GenerateWebsitePreviewInput
-): Promise<GenerateWebsitePreviewOutput> {
-  return generateWebsitePreviewFlow(input);
+/**
+ * Helper to unescape common JSON-escaped sequences that the model may produce.
+ * Converts literal "\n" sequences into actual newlines, unescapes quotes/backslashes.
+ */
+function unescapeModelContent(raw: string): string {
+  if (!raw) return raw;
+  // First, handle double-escaped sequences
+  let s = raw;
+  // Replace double-escaped newline sequences first (\\n -> \n)
+  s = s.replace(/\\\\n/g, '\n');
+  // Then single-escaped newlines (\n -> newline)
+  s = s.replace(/\\n/g, '\n');
+  // Unescape escaped quotes \" -> "
+  s = s.replace(/\\"/g, '"');
+  // Replace double-escaped backslashes \\ -> \
+  s = s.replace(/\\\\/g, '\\');
+  // Trim possible surrounding quotes (if model wrapped file content in quotes accidentally)
+  if (s.startsWith('"') && s.endsWith('"')) {
+    s = s.slice(1, -1);
+  }
+  return s;
 }
 
+/**
+ * Strong model prompt that instructs multi-file JSON manifest output and forbids escaping newlines.
+ */
 const generateWebsitePreviewPrompt = ai.definePrompt({
-  name: 'generateWebsitePreviewPrompt',
-  input: {schema: GenerateWebsitePreviewInputSchema},
-  output: {schema: GenerateWebsitePreviewOutputSchema},
-  prompt: `You are an expert full-stack frontend developer. 
-Your ONLY task is to generate a COMPLETE, REALISTIC, MULTI-FILE website project that SIMULATES a full-stack application entirely in the browser.
+  name: 'generateWebsitePreviewPrompt_v2',
+  input: { schema: GenerateWebsitePreviewInputSchema },
+  output: { schema: GenerateWebsitePreviewOutputSchema },
+  prompt: `You are an expert frontend-focused full-stack developer. Your ONLY task is to output a single JSON object (no explanation) that is a multi-file website project manifest. 
 
-==============================
-USER REQUIREMENT
-==============================
+USER PROMPT:
 {{{prompt}}}
 
-{{#if logoDataUri}}
-A logo was provided. Use it as /assets/logo.png (data URI).
-{{/if}}
-
-==============================
-ABSOLUTE RULES
-==============================
-
-1) MULTI-FILE OUTPUT (MANDATORY)
---------------------------------
-You MUST output a JSON object with this schema:
-
+REQUIREMENTS (READ CAREFULLY):
+1) Output EXACTLY ONE JSON object and NOTHING ELSE. No commentary.
+2) JSON schema must be:
 {
-  "projectName": "string",
-  "entry": "index.html",
-  "files": [
-    { "path": "index.html", "content": "..." },
-    { "path": "pages/about.html", "content": "..." },
-    { "path": "assets/styles.css", "content": "..." },
-    { "path": "assets/app.js", "content": "..." }
+  "projectName":"string",
+  "entry":"index.html",
+  "files":[
+    {"path":"index.html","content":"..."},
+    {"path":"pages/home.html","content":"..."},
+    {"path":"assets/styles.css","content":"..."},
+    {"path":"assets/app.js","content":"..."},
+    ...
   ]
 }
+3) DO NOT escape newlines inside "content". Each file's "content" must be raw text (with real newlines), not JSON-encoded text with "\n" sequences.
+4) If you are coding JS, provide raw JS content (no <script> tags in assets/app.js). HTML pages may include references like <script src="assets/app.js"></script> and <link href="assets/styles.css" rel="stylesheet">.
+5) Create separate, full HTML pages for pages/home.html, pages/products.html, pages/about.html, pages/contact.html, pages/login.html, pages/cart.html (or equivalents for the website type requested).
+6) Provide a fully functional index.html (full document including head) that loads the assets and bootstraps the preview. index.html should not contain all page content — pages/ files should contain page content.
+7) Write assets/styles.css and assets/app.js with vanilla JS that uses localStorage to simulate backend (users, cart, orders). Add responsive hamburger menu and routing via hash or history API.
+8) Use placeholder images from https://picsum.photos/seed/<seed>/800/600. Provide multiple seeds.
+9) If logoDataUri is provided, include a file: assets/logo.png (data URI) and use it in the header.
+10) Use modern, realistic text (not lorem ipsum) and fill missing details with reasonable assumptions.
+11) DO NOT mention "GenWebAI" or expose any generation UI in the output.
+12) IMPORTANT: If you cannot obey any rule, return an empty JSON object {}.
 
-• \`path\` = real folder structure  
-• \`content\` = raw text of the file  
-• **No markdown**, no explanation, no commentary  
-• **Only one JSON object**  
-
-2) PRODUCE REAL PAGES — NOT SECTIONS
-------------------------------------
-You MUST create **multiple standalone HTML pages**:
-Example (depending on user prompt):
-
-- index.html  
-- pages/home.html  
-- pages/about.html  
-- pages/products.html  
-- pages/product.html  
-- pages/cart.html  
-- pages/checkout.html  
-- pages/orders.html  
-- pages/profile.html  
-- pages/login.html  
-- pages/signup.html  
-
-Each page must be a FULL HTML document including:
-- <head> with CSS link  
-- Navbar  
-- Footer  
-- <script src="assets/app.js"></script>  
-
-3) CSS & JS SEPARATION
-----------------------
-• All styling goes to:  assets/styles.css  
-• All logic goes to:    assets/app.js  
-• You may use Tailwind CDN in HTML head if needed.  
-• NO external JS libraries allowed (no jQuery, no React, no Vue).  
-• You MUST write **vanilla JavaScript** only.
-
-4) FULL-STACK SIMULATION USING localStorage
--------------------------------------------
-Simulate server logic using \`localStorage\`:
-✔ User accounts  
-✔ Login / Signup  
-✔ Sessions  
-✔ Orders  
-✔ Wishlist tracking  
-✔ Ratings  
-✔ Cart  
-✔ Checkout steps  
-✔ Product DB seeding  
-
-Example:
-- On first load: seed sample products into localStorage  
-- signup: save user → localStorage  
-- login: verify user → localStorage  
-- add to cart: stored in localStorage  
-- place order: save order record → localStorage  
-
-NO real backend.  
-NO fetch.  
-NO external APIs.
-
-5) ALWAYS FILL COMPLETE CONTENT
--------------------------------
-Even if the user prompt is vague or incorrect:
-
-Example:
-User prompt: “make e commerce”
-→ MUST generate a full e-commerce simulation:
-- Home hero banner  
-- Product catalog  
-- Categories  
-- Cart page  
-- Checkout steps  
-- Track orders  
-- User profile  
-- Wishlist  
-- Login/Signup  
-- Responsive navbar  
-- Product pages with multiple images  
-
-Use REALISTIC content (not lorem).  
-
-6) IMAGES (REQUIRED)
---------------------
-Use any public images:
-• https://picsum.photos  
-• https://source.unsplash.com
-
-Examples:
-https://picsum.photos/seed/prod1/800/600  
-https://source.unsplash.com/random/800x600/?shoes
-
-7) LOGO (IF PROVIDED)
----------------------
-If logoDataUri exists:
-→ Create file: assets/logo.png  
-→ content = the data URI  
-
-Header must display:
-<img src="/assets/logo.png" class="h-10 w-auto"/>
-
-8) RESPONSIVE DESIGN
----------------------
-All pages MUST be fully responsive.  
-Must include:
-• hamburger menu  
-• collapsible nav  
-• mobile-friendly layout  
-
-9) PROHIBITED CONTENT
-----------------------
-You MUST NOT generate:
-- Single HTML files  
-- SPA-style hidden sections  
-- Anything referencing “GenWebAI”  
-- Comments explaining your output  
-- Markdown fences  
-- External JS libraries  
-
-10) OUTPUT FORMAT (CRITICAL)
------------------------------
-The final output must be ONLY:
-
-A RAW JSON OBJECT EXACTLY MATCHING:
-{
-  "projectName": "...",
-  "entry": "index.html",
-  "files": [ ... ]
-}
-
-NO markdown.  
-NO backticks.  
-NO prose.  
-NO commentary.  
-`,
+Return only the single JSON manifest object.`,
 });
 
+/**
+ * Flow: call the model prompt, parse output, unescape file contents just in case, and return.
+ */
 const generateWebsitePreviewFlow = ai.defineFlow(
   {
-    name: 'generateWebsitePreviewFlow',
+    name: 'generateWebsitePreviewFlow_v2',
     inputSchema: GenerateWebsitePreviewInputSchema,
     outputSchema: GenerateWebsitePreviewOutputSchema,
   },
-  async input => {
-    const {output} = await generateWebsitePreviewPrompt(input);
-    return output!;
+  async (input) => {
+    // Call model
+    const { output } = await generateWebsitePreviewPrompt(input);
+
+    if (!output) {
+      throw new Error('Model produced no output');
+    }
+
+    // Post-process file contents to remove escape artifacts
+    const cleanedFiles = (output.files || []).map((f: { path: string; content: string }) => {
+      return {
+        path: f.path,
+        content: unescapeModelContent(f.content ?? ''),
+      };
+    });
+
+    // If logoDataUri provided, ensure it's present as assets/logo.png (already likely included by model).
+    if (input.logoDataUri) {
+      const hasLogo = cleanedFiles.some((f) => f.path === 'assets/logo.png');
+      if (!hasLogo) {
+        cleanedFiles.push({
+          path: 'assets/logo.png',
+          content: input.logoDataUri,
+        });
+      }
+    }
+
+    const result = {
+      projectName: output.projectName || 'generated-project',
+      entry: output.entry || 'index.html',
+      files: cleanedFiles,
+    };
+
+    // Validate slightly
+    if (!result.files || result.files.length === 0) {
+      throw new Error('No files generated by model');
+    }
+
+    return result;
   }
 );
+
+export async function generateWebsitePreview(input: GenerateWebsitePreviewInput): Promise<GenerateWebsitePreviewOutput> {
+  return generateWebsitePreviewFlow(input);
+}
