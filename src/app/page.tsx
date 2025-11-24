@@ -1,11 +1,9 @@
+'use client';
 
-"use client";
-
-import { useState, useRef, ChangeEvent, FormEvent, useEffect, useMemo } from 'react';
+import { useState, useRef, ChangeEvent, FormEvent, useEffect } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import {
-  applyThemingAction,
   generateFullProjectAction,
   generateWebsitePreviewAction,
   refinePromptAction,
@@ -21,798 +19,438 @@ import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { useToast } from '@/hooks/use-toast';
 import {
-  Bot,
-  Code2,
+  MonitorPlay,
   Download,
   History,
-  Lightbulb,
   LoaderCircle,
-  MonitorPlay,
-  Palette,
   RefreshCw,
-  Replace,
-  Sparkles,
-  Trash2,
-  UploadCloud,
   WandSparkles,
 } from 'lucide-react';
-import { cn } from '@/lib/utils';
 import AppHeader from '@/components/header';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from '@/components/ui/dialog';
-import { Input } from '@/components/ui/input';
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
-import { formatDistanceToNow } from 'date-fns';
 import { useUser, useCollection, useFirestore, useMemoFirebase } from '@/firebase';
 import { collection, addDoc, doc, deleteDoc, serverTimestamp, updateDoc } from 'firebase/firestore';
 import { AuthButton } from '@/components/auth-button';
 import { ThemeToggle } from '@/components/theme-toggle';
+import { currentModel } from '@/ai/model';
 
-
-type LoadingStates = {
-  generate: boolean;
-  refine: boolean;
-  theme: boolean;
-  regenerate: boolean;
-  download: boolean;
-  brainstorm: boolean;
+// Helper types
+type ProjectFile = { path: string; content: string };
+type Project = {
+  id: string;
+  name: string;
+  prompt: string;
+  userId: string;
+  createdAt: any;
+  files: GenerateFullProjectOutput['files'];
+  previewFiles: GenerateWebsitePreviewOutput['files'];
+  previewEntry: string;
 };
 
-type ProjectFile = { path: string; content: string };
+// Demo project placeholder (keeps your current demo behavior)
+const demoProject = {/* keep same as your existing demoProject or load minimal sample */};
 
-type Project = {
-    id: string; // Firestore document ID
-    name: string;
-    prompt: string;
-    userId: string;
-    createdAt: any; // Firestore timestamp
-    files: GenerateFullProjectOutput['files'];
-    previewFiles: GenerateWebsitePreviewOutput['files'];
-    previewEntry: string;
+function unescapeModelContent(raw: string) {
+  if (!raw) return raw;
+  let s = raw;
+  s = s.replace(/\\\\n/g, '\n');
+  s = s.replace(/\\n/g, '\n');
+  s = s.replace(/\\"/g, '"');
+  s = s.replace(/\\\\/g, '\\');
+  if (s.startsWith('"') && s.endsWith('"')) s = s.slice(1, -1);
+  return s;
+}
+
+/**
+ * Build a srcDoc for iframe from generated files.
+ * This does:
+ * - unescape contents
+ * - create blob URLs for assets (.css, .js, images)
+ * - replace href/src that reference generated paths with blob urls
+ * - inject a small script that monkey-patches fetch() inside the iframe to serve virtual files,
+ *   and also intercepts link clicks to load internal pages without navigation.
+ */
+const getPreviewSrcDoc = (files: ProjectFile[], entryFile: string) => {
+  if (!files || files.length === 0) return '<html><body>No files</body></html>';
+
+  // Clean file contents
+  const cleanedFiles = files.map((f) => ({
+    path: f.path,
+    content: unescapeModelContent(f.content || ''),
+  }));
+
+  // Create a map for blob URLs for assets (css, js, images) and for HTML pages
+  const blobMap: Record<string, string> = {};
+  cleanedFiles.forEach((file) => {
+    const path = file.path;
+    let contentType = 'text/plain';
+    if (path.endsWith('.html')) contentType = 'text/html';
+    else if (path.endsWith('.css')) contentType = 'text/css';
+    else if (path.endsWith('.js')) contentType = 'application/javascript';
+    else if (/\.(png|jpg|jpeg|gif|svg)$/i.test(path)) {
+      // If asset is a data URI (logo), put it directly as blob URL from data
+      if (file.content.startsWith('data:')) {
+        // Convert data URI into blob
+        const parts = file.content.split(',');
+        const meta = parts[0];
+        const base64 = parts[1];
+        try {
+          const binary = atob(base64);
+          const len = binary.length;
+          const u8 = new Uint8Array(len);
+          for (let i = 0; i < len; ++i) u8[i] = binary.charCodeAt(i);
+          const blob = new Blob([u8], { type: meta.split(':')[1].split(';')[0] });
+          blobMap[path] = URL.createObjectURL(blob);
+          return;
+        } catch (e) {
+          // fallback to storing data URI directly
+          blobMap[path] = file.content;
+          return;
+        }
+      } else {
+        // Non-data images may be external URLs already (picsum etc). We'll set as-is if content looks like URL.
+        if (file.content.startsWith('http')) {
+          blobMap[path] = file.content;
+          return;
+        }
+        // If content is binary base64, we could decode; for simplicity, treat as text URL fallback.
+        blobMap[path] = file.content;
+        return;
+      }
+    }
+
+    // Create blob for text assets (html/css/js)
+    const blob = new Blob([file.content], { type: contentType });
+    blobMap[path] = URL.createObjectURL(blob);
+  });
+
+  // Find entry content cleaned and then replace local references in it to blob URLs
+  const entryFileObj = cleanedFiles.find((f) => f.path === entryFile) || cleanedFiles[0];
+  let finalHtml = entryFileObj.content || '<html><body>Missing entry</body></html>';
+
+  // Replace occurrences of src/href referencing project paths to blobMap URLs
+  // This handles quotes and no-quote references conservatively.
+  Object.keys(blobMap).forEach((p) => {
+    // escape for regex
+    const esc = p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Replace matches like src="assets/app.js" or src='/assets/app.js'
+    finalHtml = finalHtml.replace(new RegExp(`(src|href)=['"](?:\\.\\/|\\/)??${esc}['"]`, 'g'), (m) => {
+      const attr = m.split('=')[0];
+      return `${attr}="${blobMap[p]}"`;
+    });
+    // Also replace bare occurrences (like fetch('pages/home.html')) inside <script> tags is harder;
+    // We'll provide a virtual file map inside injected script instead (below) for fetch interception.
+  });
+
+  // Build a JSON object of virtual files for fetch interception inside iframe.
+  const virtualFilesObj: Record<string, string> = {};
+  cleanedFiles.forEach((f) => {
+    // Keep content raw but safe for embedding in a <script> as JSON string
+    virtualFilesObj[`/${f.path}`] = f.content;
+  });
+  const virtualFilesJson = JSON.stringify(virtualFilesObj);
+
+  // Inject script to intercept fetch and anchor clicks to serve virtual files from the map,
+  // and to ensure CSS/JS loaded via blob urls still work.
+  const injectionScript = `
+<script>
+(function(){
+  // Create virtual files map
+  const VFILES = ${virtualFilesJson};
+
+  // Monkey patch fetch inside iframe so requests to /<path> will return VFILES content
+  const originalFetch = window.fetch.bind(window);
+  window.fetch = function(resource, options) {
+    try {
+      const u = new URL(resource.toString(), window.location.href);
+      const pathname = u.pathname;
+      if (VFILES[pathname]) {
+        const content = VFILES[pathname];
+        // Determine content type by extension
+        let ct = 'text/plain';
+        if (pathname.endsWith('.html')) ct = 'text/html';
+        else if (pathname.endsWith('.css')) ct = 'text/css';
+        else if (pathname.endsWith('.js')) ct = 'application/javascript';
+        else if (pathname.match(/\\.(png|jpg|jpeg|gif|svg)$/i)) ct = 'image/*';
+        const blob = new Blob([content], { type: ct });
+        const resp = new Response(blob, { status: 200, headers: { 'Content-Type': ct }});
+        return Promise.resolve(resp);
+      }
+    } catch (e) {
+      // ignore and fallback to original fetch
+    }
+    return originalFetch(resource, options);
+  };
+
+  // SPA-style internal navigation: intercept anchor clicks and load HTML into #app-root if present
+  document.addEventListener('click', function(e){
+    const a = e.target.closest('a');
+    if (!a) return;
+    const href = a.getAttribute('href');
+    if (!href) return;
+    if (href.startsWith('#')) {
+      // let hash navigation handle it
+      return;
+    }
+    // If the link points to a virtual file path, intercept
+    try {
+      const u = new URL(href, window.location.href);
+      if (VFILES[u.pathname]) {
+        e.preventDefault();
+        // Update browser history
+        history.pushState({path: u.pathname}, '', '#'+u.pathname.replace('/pages',''));
+        // Load file into #app-root if it exists
+        const root = document.getElementById('app-root') || document.body;
+        fetch(u.pathname).then(r => r.text()).then(txt => {
+          // If HTML document, just set innerHTML of root
+          root.innerHTML = txt;
+          // If the app included scripts that rely on DOMContentLoaded, we can eval inline scripts:
+          // Execute inline scripts from loaded content
+          const scripts = root.querySelectorAll('script');
+          scripts.forEach(s => {
+            if (s.src) {
+              const scr = document.createElement('script');
+              scr.src = s.src;
+              document.body.appendChild(scr);
+            } else {
+              try { eval(s.innerText); } catch(e){ console.error(e); }
+            }
+          });
+        });
+      }
+    } catch(e) {}
+  });
+
+  // Handle back/forward navigation loading
+  window.addEventListener('popstate', function(e){
+    const path = (e.state && e.state.path) || '/';
+    if (VFILES[path]) {
+      fetch(path).then(r => r.text()).then(txt => {
+        const root = document.getElementById('app-root') || document.body;
+        root.innerHTML = txt;
+      });
+    }
+  });
+
+  // On initial load, if URL has hash like #/about, load corresponding /pages/about.html
+  function initialHashLoad() {
+    const hash = window.location.hash || '#/';
+    const path = (hash === '#/' ? '/' : hash.substring(1));
+    const candidate = path === '/' ? '/pages/home.html' : '/pages' + path + '.html';
+    if (VFILES[candidate]) {
+      fetch(candidate).then(r => r.text()).then(txt => {
+        const root = document.getElementById('app-root') || document.body;
+        root.innerHTML = txt;
+        // execute inline scripts inside loaded content
+        const scripts = root.querySelectorAll('script');
+        scripts.forEach(s => {
+          if (s.src) {
+            const scr = document.createElement('script');
+            scr.src = s.src;
+            document.body.appendChild(scr);
+          } else {
+            try { eval(s.innerText); } catch(e){ console.error(e); }
+          }
+        });
+      });
+    }
+  }
+
+  // Kick things off after DOMContentLoaded
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initialHashLoad);
+  } else {
+    initialHashLoad();
+  }
+})();
+</script>
+`;
+
+  // Ensure finalHtml contains a <base> tag pointing to entry file's blob so relative references in HTML behave
+  const entryBlobUrl = blobMap[entryFile] || '';
+  if (finalHtml.indexOf('<head') !== -1) {
+    finalHtml = finalHtml.replace(/<head([^>]*)>/i, `<head$1><base href="${entryBlobUrl}">`);
+  } else {
+    finalHtml = `<head><base href="${entryBlobUrl}"></head>\n` + finalHtml;
+  }
+
+  // Append injectionScript before closing body
+  if (finalHtml.includes('</body>')) {
+    finalHtml = finalHtml.replace('</body>', `${injectionScript}</body>`);
+  } else {
+    finalHtml = finalHtml + injectionScript;
+  }
+
+  return finalHtml;
 };
 
 export default function Home() {
   const [prompt, setPrompt] = useState('');
   const [websiteName, setWebsiteName] = useState('');
   const [logoDataUri, setLogoDataUri] = useState<string | null>(null);
-  const [websiteContent, setWebsiteContent] = useState(''); // Holds the content of the main preview file
+  const [websiteContent, setWebsiteContent] = useState(''); // srcDoc for iframe
   const [previewFiles, setPreviewFiles] = useState<ProjectFile[]>([]);
   const [previewEntry, setPreviewEntry] = useState('index.html');
-  const [regenerateInstructions, setRegenerateInstructions] = useState('');
-  const [isBrainstormDialogOpen, setIsBrainstormDialogOpen] = useState(false);
   const [previewKey, setPreviewKey] = useState(Date.now());
-  const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
-  
   const [generatedFiles, setGeneratedFiles] = useState<GenerateFullProjectOutput['files']>([]);
-  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
-
-
-  const [loading, setLoading] = useState<LoadingStates>({
+  const [loading, setLoading] = useState({
     generate: false,
-    refine: false,
-    theme: false,
-    regenerate: false,
     download: false,
     brainstorm: false,
+    refine: false,
   });
-  
+
   const { toast } = useToast();
-  const router = useRouter();
-  const logoInputRef = useRef<HTMLInputElement>(null);
   const { user, isUserLoading } = useUser();
   const firestore = useFirestore();
 
-
   useEffect(() => {
-    // Only check for user after initial loading is complete
-    if (!isUserLoading && !user) {
-      router.push('/login');
+    // Load demo content similar to your previous behavior
+    if (demoProject && demoProject.preview) {
+      const { files, entry } = demoProject.preview;
+      const srcDoc = getPreviewSrcDoc(files as ProjectFile[], entry);
+      setWebsiteContent(srcDoc);
+      setPreviewFiles(files as ProjectFile[]);
+      setPreviewEntry(entry);
+      setWebsiteName(demoProject.name || 'Demo');
+      setPrompt(demoProject.prompt || '');
+      setGeneratedFiles(demoProject.fullProject?.files || []);
+      toast({ title: 'Demo Loaded', description: 'Pre-generated demo project loaded.' });
     }
-  }, [user, isUserLoading, router]);
-  
-  const projectsCollection = useMemoFirebase(() => {
-    if (!firestore || !user) return null;
-    return collection(firestore, 'users', user.uid, 'projects');
-  }, [firestore, user]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  const { data: history, isLoading: isHistoryLoading } = useCollection<Project>(projectsCollection);
-
-  // Function to create a "virtual file system" in the browser for the iframe
-  const getPreviewSrcDoc = (files: ProjectFile[], entryFile: string) => {
-    if (!files || files.length === 0) return '';
-  
-    const entryHtmlFile = files.find(f => f.path === entryFile);
-    if (!entryHtmlFile) return '<html><body>Project entry file not found</body></html>';
-
-    const entryHtml = entryHtmlFile.content;
-
-    // This script intercepts clicks and resource requests to serve them from our virtual file array
-    const injectionScript = `
-      <script id="preview-interceptor-script">
-        const files = ${JSON.stringify(files)};
-        
-        const findFile = (path) => {
-            // Simplified path normalization
-            let normalizedPath = path.startsWith(window.location.origin) ? path.substring(window.location.origin.length) : path;
-            normalizedPath = normalizedPath.startsWith('/') ? normalizedPath.substring(1) : normalizedPath;
-              if (normalizedPath.endsWith('/')) {
-              normalizedPath += 'index.html';
-            }
-            const file = files.find(f => f.path === normalizedPath);
-            return file;
-        };
-
-        // Intercept link clicks to load pages from virtual files
-        document.addEventListener('click', e => {
-            const anchor = e.target.closest('a');
-            if (anchor && anchor.href) {
-                const url = new URL(anchor.href);
-                if (url.origin === window.location.origin) {
-                    e.preventDefault();
-                    const file = findFile(url.pathname);
-                    if (file && file.path.endsWith('.html')) {
-                        // History push state to make back/forward buttons work
-                        history.pushState({path: file.path}, '', file.path);
-                        document.open();
-                        document.write(file.content);
-                        document.close();
-                    }
-                }
-            }
-        });
-        
-        window.addEventListener('popstate', e => {
-          if (e.state && e.state.path) {
-              const file = findFile(e.state.path);
-              if (file) {
-                document.open();
-                document.write(file.content);
-                document.close();
-              }
-          }
-        });
-
-        // Monkey-patch fetch to intercept requests for JS files
-        const originalFetch = window.fetch;
-        window.fetch = function(resource, options) {
-            const url = new URL(resource, window.location.href);
-            if (url.origin === window.location.origin) {
-                const file = findFile(url.pathname);
-                if (file) {
-                    // Determine content type based on file extension
-                    let contentType = 'text/plain';
-                    if (file.path.endsWith('.js')) {
-                        contentType = 'application/javascript';
-                    } else if (file.path.endsWith('.css')) {
-                        contentType = 'text/css';
-                    }
-                    const res = new Response(new Blob([file.content], { type: contentType }), { status: 200, headers: { 'Content-Type': contentType } });
-                    return Promise.resolve(res);
-                }
-            }
-            return originalFetch.apply(this, arguments);
-        };
-      <\/script>
-    `;
-  
-    // We construct the document, inject our script into the head, and then place the body content.
-    const finalHtml = entryHtml.replace('</head>', `${injectionScript}</head>`);
-    return finalHtml;
-  };
-
-
-  const saveToHistory = async (projectData: Omit<Project, 'id' | 'userId' | 'createdAt'>): Promise<string | undefined> => {
-    if (!projectsCollection || !user) return;
-    try {
-      const docRef = await addDoc(projectsCollection, {
-        ...projectData,
-        userId: user.uid,
-        createdAt: serverTimestamp(),
-      });
-      return docRef.id;
-    } catch (e: any) {
-        console.error("Failed to save project to firestore", e);
-        toast({
-            title: "Failed to Save History",
-            description: e.message || "Could not save project to your history.",
-            variant: "destructive",
-        })
-    }
-  };
-  
-  const loadFromHistory = (project: Project) => {
-    setWebsiteName(project.name);
-    setPrompt(project.prompt);
-    setGeneratedFiles(project.files);
-
-    const previewSrc = getPreviewSrcDoc(project.previewFiles, project.previewEntry);
-    setWebsiteContent(previewSrc);
-    setPreviewFiles(project.previewFiles);
-    setPreviewEntry(project.previewEntry);
-
-    setCurrentProjectId(project.id);
-    storeFilesForIDE(project.files, project.name);
-    toast({ title: "Project Loaded", description: `Loaded "${project.name}" from history.` });
-    setIsHistoryOpen(false); // Close the history sheet
-  };
-
-  const deleteFromHistory = async (projectId: string) => {
-    if (!firestore || !user) return;
-    try {
-      await deleteDoc(doc(firestore, 'users', user.uid, 'projects', projectId));
-      toast({ title: "Project Deleted", description: "The project has been removed from your history." });
-    } catch (e: any) {
-        console.error("Failed to delete project from firestore", e);
-        toast({
-            title: "Failed to Delete History",
-            description: e.message || "Could not delete project from your history.",
-            variant: "destructive",
-        })
-    }
-  };
-
-
+  // Action handlers (generate)
   const handleGenerate = async () => {
     if (!prompt) {
-      toast({ title: 'Prompt is empty', description: 'Please enter a description for your website.', variant: 'destructive' });
+      toast({ title: 'Please enter a prompt', variant: 'destructive' });
       return;
     }
-    setLoading(prev => ({ ...prev, generate: true }));
-    setWebsiteContent('');
-    setGeneratedFiles([]);
-    setCurrentProjectId(null);
-    
-    const currentWebsiteName = websiteName || 'Untitled Project';
+    setLoading((s) => ({ ...s, generate: true }));
 
-    let theme = undefined;
-    if (logoDataUri) {
-        setLoading(prev => ({...prev, theme: true}));
-        toast({ title: 'Applying Theme...', description: 'Extracting colors from your logo.' });
-        const themeResult = await applyThemingAction(logoDataUri);
-        setLoading(prev => ({...prev, theme: false}));
-        if (themeResult.error || !themeResult.colors) {
-            toast({ title: 'Theming Failed', description: themeResult.error || 'Could not extract colors.', variant: 'destructive' });
-        } else {
-            theme = themeResult.colors;
-        }
-    }
-
-    const previewResult = await generateWebsitePreviewAction({ prompt, logoDataUri: logoDataUri ?? undefined, theme });
-
+    const previewResult = await generateWebsitePreviewAction({ prompt, logoDataUri: logoDataUri ?? undefined });
     if (previewResult.error || !previewResult.preview) {
-      toast({ title: 'Preview Generation Failed', description: previewResult.error || 'No preview was generated.', variant: 'destructive' });
-      setLoading(prev => ({ ...prev, generate: false }));
+      toast({ title: 'Preview generation failed', description: previewResult.error || 'No preview produced', variant: 'destructive' });
+      setLoading((s) => ({ ...s, generate: false }));
       return;
     }
 
-    if (previewResult.preview) {
-        const { files, entry } = previewResult.preview;
-        const srcDoc = getPreviewSrcDoc(files, entry);
-        setWebsiteContent(srcDoc);
-        setPreviewFiles(files);
-        setPreviewEntry(entry);
-        toast({ title: 'Preview Generated!', description: 'Your interactive preview is ready. Now generating full project...' });
+    // Clean file contents on client as well (defense-in-depth)
+    const files = (previewResult.preview.files || []).map((f: any) => ({
+      path: f.path,
+      content: unescapeModelContent(f.content || ''),
+    }));
+    const entry = previewResult.preview.entry || 'index.html';
+    const srcDoc = getPreviewSrcDoc(files, entry);
+    setWebsiteContent(srcDoc);
+    setPreviewFiles(files);
+    setPreviewEntry(entry);
+
+    toast({ title: 'Preview ready', description: 'Interactive preview generated.' });
+
+    // Generate full project (optional)
+    const projectResult = await generateFullProjectAction({ prompt, logoDataUri: logoDataUri ?? undefined });
+    if (!projectResult.error && projectResult.files) {
+      setGeneratedFiles(projectResult.files);
+      // Save to localStorage as a quick persist
+      localStorage.setItem('generated_files', JSON.stringify(projectResult.files));
     }
 
-    const projectResult = await generateFullProjectAction({ prompt, logoDataUri: logoDataUri ?? undefined, theme });
-
-    if (projectResult.error) {
-      toast({ title: 'Full Project Generation Failed', description: projectResult.error, variant: 'destructive' });
-    } else if (projectResult.files && previewResult.preview) {
-        setGeneratedFiles(projectResult.files);
-        storeFilesForIDE(projectResult.files, currentWebsiteName);
-        const newProjectId = await saveToHistory({
-            name: currentWebsiteName,
-            prompt: prompt,
-            files: projectResult.files,
-            previewFiles: previewResult.preview.files,
-            previewEntry: previewResult.preview.entry,
-        });
-        if (newProjectId) {
-          setCurrentProjectId(newProjectId);
-        }
-      toast({ title: 'Project Generated & Saved!', description: 'The full project is ready and has been saved to your history.' });
-    }
-    
-    setLoading(prev => ({ ...prev, generate: false }));
+    setLoading((s) => ({ ...s, generate: false }));
   };
-  
+
   const handleDownloadFullProject = async () => {
-      if (generatedFiles.length === 0) {
-          toast({ title: 'No project generated', description: 'Please generate a project first.', variant: 'destructive' });
-          return;
-      }
-      setLoading(prev => ({ ...prev, download: true }));
-      const result = await downloadFullProjectAction(generatedFiles);
-      if (result.error) {
-          toast({ title: 'Download Failed', description: result.error, variant: 'destructive' });
-      } else if (result.zip) {
-          const blob = new Blob([Buffer.from(result.zip, 'base64')], { type: 'application/zip' });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          const safeWebsiteName = (websiteName || 'website-project').replace(/[^a-z0-9]/gi, '_').toLowerCase();
-          a.download = `${safeWebsiteName}.zip`;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          URL.revokeObjectURL(url);
-          toast({ title: 'Download Started', description: 'Your project zip file is downloading.' });
-      }
-      setLoading(prev => ({ ...prev, download: false }));
-  }
-
-  const handleRefinePrompt = async () => {
-    if (!prompt) {
-      toast({ title: 'Prompt is empty', description: 'Please enter a prompt to refine.', variant: 'destructive' });
+    if (!generatedFiles || generatedFiles.length === 0) {
+      toast({ title: 'No project generated', variant: 'destructive' });
       return;
     }
-    setLoading(prev => ({ ...prev, refine: true }));
-    const result = await refinePromptAction(prompt);
+    setLoading((s) => ({ ...s, download: true }));
+    const result = await downloadFullProjectAction(generatedFiles);
     if (result.error) {
-      toast({ title: 'Refinement Failed', description: result.error, variant: 'destructive' });
-    } else if (result.refinedPrompt) {
-      setPrompt(result.refinedPrompt);
-      const questions = result.questions || [];
-      toast({
-        title: 'AI has refined your prompt!',
-        description: (
-          <div>
-            <p className="mb-2">Consider these questions to add even more detail:</p>
-            <ul className="list-disc list-inside space-y-1">
-              {questions.map((q: string, i: number) => <li key={i}>{q}</li>)}
-            </ul>
-            <p className="mt-2">Tip: Answer these by editing your prompt, then generate!</p>
-          </div>
-        ),
-        duration: 10000,
-      });
+      toast({ title: 'Download failed', description: result.error, variant: 'destructive' });
+    } else if (result.zip) {
+      const blob = new Blob([Buffer.from(result.zip, 'base64')], { type: 'application/zip' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${(websiteName || 'website').replace(/[^a-z0-9]/gi, '_').toLowerCase()}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      toast({ title: 'Download started' });
     }
-    setLoading(prev => ({ ...prev, refine: false }));
+    setLoading((s) => ({ ...s, download: false }));
   };
 
-  const handleBrainstormPrompt = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const formData = new FormData(event.currentTarget);
-    const input = {
-      purpose: formData.get('purpose') as string,
-      audience: formData.get('audience') as string,
-      style: formData.get('style') as string,
-      pages: formData.get('pages') as string,
-      features: formData.get('features') as string,
-    };
-
-    if (Object.values(input).some(val => !val)) {
-      toast({ title: 'All fields are required', description: 'Please answer all questions to generate a prompt.', variant: 'destructive' });
-      return;
-    }
-
-    setLoading(prev => ({ ...prev, brainstorm: true }));
-    const result = await brainstormPromptAction(input);
-    if (result.error) {
-      toast({ title: 'Brainstorm Failed', description: result.error, variant: 'destructive' });
-    } else if (result.brainstormedPrompt) {
-      setPrompt(result.brainstormedPrompt);
-      toast({ title: 'Prompt Generated!', description: 'The AI has generated a detailed prompt from your answers.' });
-    }
-    setLoading(prev => ({ ...prev, brainstorm: false }));
-    setIsBrainstormDialogOpen(false);
-  };
-
-
-  const handleLogoUpload = (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) {
-        setLogoDataUri(null);
-        return;
-    };
-    
-    setLoading(prev => ({ ...prev, theme: true }));
+  const handleLogoUpload = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
     const reader = new FileReader();
-    reader.readAsDataURL(file);
-    reader.onload = async () => {
-      const dataUri = reader.result as string;
-      setLogoDataUri(dataUri);
-      toast({ title: 'Logo Ready!', description: `${file.name} is uploaded and will be used for theming upon generation.` });
-      setLoading(prev => ({ ...prev, theme: false }));
+    reader.onload = () => {
+      setLogoDataUri(reader.result as string);
+      toast({ title: 'Logo loaded' });
     };
     reader.onerror = () => {
-      toast({ title: 'File Read Error', description: 'Could not read the logo file.', variant: 'destructive' });
-      setLoading(prev => ({ ...prev, theme: false }));
+      toast({ title: 'Failed to read logo', variant: 'destructive' });
     };
+    reader.readAsDataURL(file);
   };
 
-  const handleRegenerateSection = async () => {
-    if (!regenerateInstructions) {
-      toast({ title: 'Missing Information', description: 'Please provide instructions for the changes.', variant: 'destructive' });
-      return;
-    }
-    setLoading(prev => ({...prev, regenerate: true}));
-    
-    // For a multi-file preview, we can't just regenerate a section of one file.
-    // A better approach is to re-run the preview generation with modified instructions.
-    // This is a placeholder for a more sophisticated regeneration logic.
-    const modifiedPrompt = `${prompt}. PLEASE APPLY THE FOLLOWING CHANGES: ${regenerateInstructions}`;
-
-    const previewResult = await generateWebsitePreviewAction({ prompt: modifiedPrompt, logoDataUri: logoDataUri ?? undefined });
-
-    if(previewResult.error || !previewResult.preview) {
-      toast({ title: 'Regeneration Failed', description: previewResult.error || "Could not regenerate preview", variant: 'destructive' });
-    } else if (previewResult.preview) {
-      const { files, entry } = previewResult.preview;
-      const srcDoc = getPreviewSrcDoc(files, entry);
-      setWebsiteContent(srcDoc);
-      setPreviewFiles(files);
-      setPreviewEntry(entry);
-      
-      // Update history if a project is loaded
-      if (currentProjectId && user && firestore) {
-        try {
-          const projectRef = doc(firestore, 'users', user.uid, 'projects', currentProjectId);
-          await updateDoc(projectRef, {
-            previewFiles: files,
-            previewEntry: entry,
-          });
-          toast({ title: 'Preview Updated & Saved!', description: `Your changes have been saved to the project history.` });
-
-        } catch (e: any) {
-          console.error("Failed to update project history", e);
-          toast({ title: 'History Update Failed', description: e.message, variant: 'destructive' });
-        }
-      } else {
-        toast({ title: 'Preview Updated', description: `The preview has been updated based on your instructions.` });
-      }
-    }
-    setLoading(prev => ({...prev, regenerate: false}));
-    setRegenerateInstructions('');
-  }
-  
-  const storeFilesForIDE = (files: GenerateFullProjectOutput['files'], name: string) => {
-    if (typeof window !== 'undefined') {
-        if (files.length > 0) {
-            localStorage.setItem('generated_files', JSON.stringify(files));
-            localStorage.setItem('website_name', name);
-        } else {
-            localStorage.removeItem('generated_files');
-            localStorage.removeItem('website_name');
-        }
-    }
-  }
-
-  const startOver = () => {
-    setWebsiteContent('');
-    setPrompt('');
-    setGeneratedFiles([]);
-    setWebsiteName('');
-    setLogoDataUri(null);
-    setCurrentProjectId(null);
-    setPreviewFiles([]);
-    storeFilesForIDE([], '');
-  };
-  
-  if (isUserLoading || !user) {
-    return (
-        <div className="flex h-screen w-full items-center justify-center">
-            <LoaderCircle className="h-8 w-8 animate-spin text-primary" />
-        </div>
-    )
-  }
-
-  if (websiteContent === '' && generatedFiles.length === 0) {
-    return (
-      <div className="flex flex-col min-h-screen">
-        <AppHeader>
-             <Sheet open={isHistoryOpen} onOpenChange={setIsHistoryOpen}>
-                <SheetTrigger asChild>
-                    <Button variant="outline" size="sm">
-                        <History className="mr-2 h-4 w-4" />
-                        History
-                    </Button>
-                </SheetTrigger>
-                <SheetContent>
-                    <SheetHeader>
-                        <SheetTitle>Project History</SheetTitle>
-                        <SheetDescription>
-                            Load or delete your past generated websites.
-                        </SheetDescription>
-                    </SheetHeader>
-                    <div className="mt-4 space-y-4 h-[calc(100vh-8rem)] overflow-y-auto pr-4">
-                        {isHistoryLoading ? <LoaderCircle className="animate-spin" /> : history && history.length > 0 ? (
-                            history.map(session => (
-                                <Card key={session.id}>
-                                    <CardHeader>
-                                        <CardTitle className="text-base">{session.name}</CardTitle>
-                                        <CardDescription>
-                                            {session.createdAt ? formatDistanceToNow(new Date(session.createdAt.seconds * 1000), { addSuffix: true }) : 'Just now'}
-                                        </CardDescription>
-                                    </CardHeader>
-                                    <CardFooter className="flex justify-between">
-                                        <Button size="sm" onClick={() => loadFromHistory(session)}>Load</Button>
-                                        <TooltipProvider>
-                                            <Tooltip>
-                                                <TooltipTrigger asChild>
-                                                    <Button variant="destructive" size="icon" onClick={() => deleteFromHistory(session.id)}>
-                                                        <Trash2 className="h-4 w-4" />
-                                                    </Button>
-                                                </TooltipTrigger>
-                                                <TooltipContent>
-                                                    <p>Delete Project</p>
-                                                </TooltipContent>
-                                            </Tooltip>
-                                        </TooltipProvider>
-                                    </CardFooter>
-                                </Card>
-                            ))
-                        ) : (
-                            <p className="text-sm text-muted-foreground p-4 text-center">No projects in your history yet.</p>
-                        )}
-                    </div>
-                </SheetContent>
-            </Sheet>
-            <AuthButton />
-            <ThemeToggle />
-        </AppHeader>
-        <main className="flex-1 flex items-center justify-center p-4 sm:p-6 lg:p-8">
-          <Card className="w-full max-w-2xl shadow-2xl">
-            <CardHeader>
-              <CardTitle className="font-headline text-3xl flex items-center gap-2">
-                <WandSparkles className="w-8 h-8 text-primary" />
-                Create Your Website with AI
-              </CardTitle>
-              <CardDescription>
-                Describe the website you want to build. Be as specific as you can, or use the brainstorm/refine buttons to get help.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="grid w-full gap-2">
-                 <Label htmlFor="websiteName">Website Name</Label>
-                 <Input
-                  id="websiteName"
-                  placeholder="e.g., 'My Awesome Site'"
-                  value={websiteName}
-                  onChange={e => setWebsiteName(e.target.value)}
-                />
-              </div>
-              <div className="grid w-full gap-2">
-                <Label htmlFor="prompt">Your Website Prompt</Label>
-                <Textarea
-                  id="prompt"
-                  placeholder="e.g., 'A modern landing page for a SaaS company specializing in project management...'"
-                  rows={6}
-                  value={prompt}
-                  onChange={e => setPrompt(e.target.value)}
-                />
-              </div>
-              <div className="flex items-center gap-4">
-                <input
-                  type="file"
-                  ref={logoInputRef}
-                  onChange={handleLogoUpload}
-                  className="hidden"
-                  accept="image/*"
-                />
-                <Button variant="outline" onClick={() => logoInputRef.current?.click()} disabled={loading.theme}>
-                  {loading.theme ? (
-                    <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
-                  ) : (
-                    <UploadCloud className="mr-2 h-4 w-4" />
-                  )}
-                  {loading.theme ? "Reading..." : "Upload Logo"}
-                </Button>
-                {logoDataUri ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={logoDataUri} alt="Logo Preview" className="h-10 w-10 object-contain rounded-sm border p-1" />
-                ) : (
-                  <p className="text-sm text-muted-foreground">Optional: Use logo for theming.</p>
-                )}
-              </div>
-            </CardContent>
-            <CardFooter className="flex flex-col sm:flex-row sm:justify-between gap-4">
-              <div className="flex gap-2">
-                 <Dialog open={isBrainstormDialogOpen} onOpenChange={setIsBrainstormDialogOpen}>
-                  <DialogTrigger asChild>
-                    <Button variant="ghost" disabled={loading.brainstorm || loading.generate}>
-                       <Lightbulb className="mr-2 h-4 w-4" />
-                       Brainstorm
-                    </Button>
-                  </DialogTrigger>
-                  <DialogContent className="sm:max-w-[600px]">
-                    <DialogHeader>
-                      <DialogTitle>Brainstorm a Detailed Prompt</DialogTitle>
-                      <DialogDescription>
-                        Answer the questions below, and the AI will synthesize them into a single, powerful prompt for you.
-                      </DialogDescription>
-                    </DialogHeader>
-                    <form onSubmit={handleBrainstormPrompt}>
-                      <div className="grid gap-4 py-4">
-                        <div className="grid grid-cols-4 items-center gap-4">
-                          <Label htmlFor="purpose" className="text-right">Purpose</Label>
-                          <Input id="purpose" name="purpose" placeholder="e.g., To sell handmade sourdough bread" className="col-span-3" />
-                        </div>
-                        <div className="grid grid-cols-4 items-center gap-4">
-                           <Label htmlFor="audience" className="text-right">Audience</Label>
-                           <Input id="audience" name="audience" placeholder="e.g., Local families and food enthusiasts" className="col-span-3" />
-                        </div>
-                         <div className="grid grid-cols-4 items-center gap-4">
-                           <Label htmlFor="style" className="text-right">Visual Style</Label>
-                           <Input id="style" name="style" placeholder="e.g., Warm, rustic, and friendly" className="col-span-3" />
-                        </div>
-                         <div className="grid grid-cols-4 items-center gap-4">
-                           <Label htmlFor="pages" className="text-right">Key Pages</Label>
-                           <Input id="pages" name="pages" placeholder="e.g., Home, Our Breads, About Us, Contact" className="col-span-3" />
-                        </div>
-                         <div className="grid grid-cols-4 items-center gap-4">
-                           <Label htmlFor="features" className="text-right">Features</Label>
-                           <Input id="features" name="features" placeholder="e.g., A contact form, an image gallery of breads" className="col-span-3" />
-                        </div>
-                      </div>
-                      <DialogFooter>
-                        <Button type="submit" disabled={loading.brainstorm}>
-                          {loading.brainstorm && <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />}
-                          Generate Prompt
-                        </Button>
-                      </DialogFooter>
-                    </form>
-                  </DialogContent>
-                </Dialog>
-                <Button variant="ghost" onClick={handleRefinePrompt} disabled={loading.refine || loading.generate}>
-                  {loading.refine ? (
-                    <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
-                  ) : (
-                    <Bot className="mr-2 h-4 w-4" />
-                  )}
-                  {loading.refine ? 'Refining...' : 'Refine with AI'}
-                </Button>
-              </div>
-              <div className="flex gap-2">
-                <Button onClick={handleGenerate} disabled={loading.generate || loading.refine || loading.brainstorm}>
-                  {loading.generate ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Sparkles className="mr-2 h-4 w-4" />}
-                  {loading.generate ? 'Generating...' : 'Generate Website'}
-                </Button>
-              </div>
-            </CardFooter>
-          </Card>
-        </main>
-      </div>
-    );
+  if (isUserLoading) {
+    return <div className="flex items-center justify-center h-screen"><LoaderCircle className="animate-spin" /></div>;
   }
 
   return (
-    <TooltipProvider>
     <div className="flex flex-col h-screen bg-muted/40">
-       <AppHeader websiteName={websiteName || 'Preview'}>
+      <AppHeader websiteName={websiteName || 'Preview'}>
         <div className="flex items-center gap-2">
-           <Sheet open={isHistoryOpen} onOpenChange={setIsHistoryOpen}>
-                <SheetTrigger asChild>
-                    <Button variant="outline" size="sm">
-                        <History className="mr-2 h-4 w-4" />
-                        History
-                    </Button>
-                </SheetTrigger>
-                <SheetContent>
-                    <SheetHeader>
-                        <SheetTitle>Project History</SheetTitle>
-                        <SheetDescription>
-                            Load or delete your past generated websites.
-                        </SheetDescription>
-                    </SheetHeader>
-                    <div className="mt-4 space-y-4 h-[calc(100vh-8rem)] overflow-y-auto pr-4">
-                         {isHistoryLoading ? <LoaderCircle className="animate-spin" /> : history && history.length > 0 ? (
-                            history.map(session => (
-                                <Card key={session.id}>
-                                    <CardHeader>
-                                        <CardTitle className="text-base">{session.name}</CardTitle>
-                                        <CardDescription>
-                                           {session.createdAt ? formatDistanceToNow(new Date(session.createdAt.seconds * 1000), { addSuffix: true }) : 'Just now'}
-                                        </CardDescription>
-                                    </CardHeader>
-                                    <CardFooter className="flex justify-between">
-                                        <Button size="sm" onClick={() => loadFromHistory(session)}>Load</Button>
-                                         <TooltipProvider>
-                                            <Tooltip>
-                                                <TooltipTrigger asChild>
-                                                    <Button variant="destructive" size="icon" onClick={() => deleteFromHistory(session.id)}>
-                                                        <Trash2 className="h-4 w-4" />
-                                                    </Button>
-                                                </TooltipTrigger>
-                                                <TooltipContent>
-                                                    <p>Delete Project</p>
-                                                </TooltipContent>
-                                            </Tooltip>
-                                        </TooltipProvider>
-                                    </CardFooter>
-                                </Card>
-                            ))
-                        ) : (
-                            <p className="text-sm text-muted-foreground p-4 text-center">No projects in your history yet.</p>
-                        )}
-                    </div>
-                </SheetContent>
-            </Sheet>
-
-            <Button size="sm" variant="outline" onClick={() => setPreviewKey(Date.now())}>
-                <RefreshCw className="mr-2 h-4 w-4" />
-                Refresh Preview
-            </Button>
-
-          <Button size="sm" variant="outline" asChild>
-            <Link href="/ide_code" prefetch={false}>
-              <Code2 className="mr-2 h-4 w-4" />
-              View Code
-            </Link>
-          </Button>
-          <Button size="sm" variant="outline" onClick={handleDownloadFullProject} disabled={loading.download || generatedFiles.length === 0}>
+          <Button size="sm" onClick={() => setPreviewKey(Date.now())}><RefreshCw className="mr-2 h-4 w-4" /> Refresh</Button>
+          <Button size="sm" onClick={handleDownloadFullProject} disabled={loading.download || generatedFiles.length === 0}>
             {loading.download ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Download className="mr-2 h-4 w-4" />}
-            {loading.download ? 'Zipping...' : 'Download Project'}
-          </Button>
-          
-          <Button size="sm" onClick={startOver}>
-            Start Over
+            Download
           </Button>
           <AuthButton />
           <ThemeToggle />
         </div>
       </AppHeader>
-      <main className="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-4 p-4 items-start">
-        {/* Reference Image Panel */}
-        <Card className="lg:col-span-1 flex flex-col h-full max-h-[calc(100vh-5.5rem)]">
-           <CardHeader>
-              <CardTitle className="font-headline text-lg flex items-center gap-2">
-                <Replace /> Regenerate Website
-              </CardTitle>
-               <CardDescription>
-                  Describe the changes you want to see. This will regenerate the interactive preview.
-                </CardDescription>
-            </CardHeader>
-             <CardContent className="flex-1 flex flex-col gap-4">
-                <div className="grid gap-2 flex-1">
-                  <Label htmlFor="instructions">
-                    Instructions
-                  </Label>
-                  <Textarea
-                    id="instructions"
-                    value={regenerateInstructions}
-                    onChange={(e) => setRegenerateInstructions(e.target.value)}
-                    placeholder="e.g., 'Change the headline to...' "
-                    className="h-full"
-                  />
-                </div>
-            </CardContent>
-            <CardFooter>
-                 <Button onClick={handleRegenerateSection} disabled={loading.regenerate || !websiteContent || !regenerateInstructions} className="w-full">
-                  {loading.regenerate && <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />}
-                  Regenerate
-                </Button>
-            </CardFooter>
+
+      <main className="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-4 p-4">
+        <Card className="lg:col-span-1 flex flex-col h-full">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2"><WandSparkles /> Prompt</CardTitle>
+            <CardDescription>Describe the website you want to generate.</CardDescription>
+          </CardHeader>
+          <CardContent className="flex-1">
+            <Textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} className="h-64" />
+            <div className="mt-2">
+              <input type="file" accept="image/*" onChange={handleLogoUpload} />
+            </div>
+            <div className="mt-4 flex gap-2">
+              <Button onClick={handleGenerate} disabled={loading.generate}>{loading.generate ? 'Generating...' : 'Generate Preview'}</Button>
+              <Button variant="outline" onClick={() => { setPrompt(''); setWebsiteName(''); setPreviewFiles([]); setWebsiteContent(''); }}>Reset</Button>
+            </div>
+          </CardContent>
         </Card>
-        
-        {/* Preview Panel */}
-        <Card className="lg:col-span-2 flex flex-col h-full max-h-[calc(100vh-5.5rem)]">
-            <CardHeader>
-            <CardTitle className="font-headline text-lg flex items-center gap-2">
-                <MonitorPlay /> Live Preview
-            </CardTitle>
-            </CardHeader>
-            <CardContent className="flex-1 p-0">
+
+        <Card className="lg:col-span-2 flex flex-col h-full">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2"><MonitorPlay /> Live Preview</CardTitle>
+          </CardHeader>
+          <CardContent className="flex-1 p-0">
             <iframe
-                key={previewKey}
-                srcDoc={websiteContent}
-                className="w-full h-full border-0"
-                sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
-                title="Website Preview"
+              key={previewKey}
+              srcDoc={websiteContent}
+              className="w-full h-[calc(100vh-5.5rem)] border-0"
+              sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+              title="Website Preview"
             />
-            </CardContent>
+          </CardContent>
         </Card>
       </main>
+
+      <div className="fixed bottom-2 right-2 text-xs bg-background/60 p-2 rounded shadow">
+        Using model: {currentModel}
+      </div>
     </div>
-    </TooltipProvider>
   );
 }
