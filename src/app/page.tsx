@@ -14,6 +14,7 @@ import {
   brainstormPromptAction,
 } from '@/app/actions';
 import type { GenerateFullProjectOutput } from '@/ai/flows/generate-full-project';
+import type { GenerateWebsitePreviewOutput } from '@/ai/flows/generate-website-from-prompt';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
 import { Textarea } from '@/components/ui/textarea';
@@ -65,6 +66,8 @@ type LoadingStates = {
   brainstorm: boolean;
 };
 
+type ProjectFile = { path: string; content: string };
+
 type Project = {
     id: string; // Firestore document ID
     name: string;
@@ -72,14 +75,17 @@ type Project = {
     userId: string;
     createdAt: any; // Firestore timestamp
     files: GenerateFullProjectOutput['files'];
-    previewContent: string;
+    previewFiles: GenerateWebsitePreviewOutput['files'];
+    previewEntry: string;
 };
 
 export default function Home() {
   const [prompt, setPrompt] = useState('');
   const [websiteName, setWebsiteName] = useState('');
   const [logoDataUri, setLogoDataUri] = useState<string | null>(null);
-  const [websiteContent, setWebsiteContent] = useState('');
+  const [websiteContent, setWebsiteContent] = useState(''); // Holds the content of the main preview file
+  const [previewFiles, setPreviewFiles] = useState<ProjectFile[]>([]);
+  const [previewEntry, setPreviewEntry] = useState('index.html');
   const [regenerateInstructions, setRegenerateInstructions] = useState('');
   const [isBrainstormDialogOpen, setIsBrainstormDialogOpen] = useState(false);
   const [previewKey, setPreviewKey] = useState(Date.now());
@@ -119,6 +125,90 @@ export default function Home() {
 
   const { data: history, isLoading: isHistoryLoading } = useCollection<Project>(projectsCollection);
 
+  // Function to create a "virtual file system" in the browser for the iframe
+  const getPreviewSrcDoc = (files: ProjectFile[], entryFile: string) => {
+    if (!files || files.length === 0) return '';
+  
+    const entryHtmlFile = files.find(f => f.path === entryFile);
+    if (!entryHtmlFile) return '<html><body>Project entry file not found</body></html>';
+
+    const entryHtml = entryHtmlFile.content;
+
+    // This script intercepts clicks and resource requests to serve them from our virtual file array
+    const injectionScript = `
+      <script id="preview-interceptor-script">
+        const files = ${JSON.stringify(files)};
+        
+        const findFile = (path) => {
+            // Simplified path normalization
+            let normalizedPath = path.startsWith(window.location.origin) ? path.substring(window.location.origin.length) : path;
+            normalizedPath = normalizedPath.startsWith('/') ? normalizedPath.substring(1) : normalizedPath;
+              if (normalizedPath.endsWith('/')) {
+              normalizedPath += 'index.html';
+            }
+            const file = files.find(f => f.path === normalizedPath);
+            return file;
+        };
+
+        // Intercept link clicks to load pages from virtual files
+        document.addEventListener('click', e => {
+            const anchor = e.target.closest('a');
+            if (anchor && anchor.href) {
+                const url = new URL(anchor.href);
+                if (url.origin === window.location.origin) {
+                    e.preventDefault();
+                    const file = findFile(url.pathname);
+                    if (file && file.path.endsWith('.html')) {
+                        // History push state to make back/forward buttons work
+                        history.pushState({path: file.path}, '', file.path);
+                        document.open();
+                        document.write(file.content);
+                        document.close();
+                    }
+                }
+            }
+        });
+        
+        window.addEventListener('popstate', e => {
+          if (e.state && e.state.path) {
+              const file = findFile(e.state.path);
+              if (file) {
+                document.open();
+                document.write(file.content);
+                document.close();
+              }
+          }
+        });
+
+        // Monkey-patch fetch to intercept requests for JS files
+        const originalFetch = window.fetch;
+        window.fetch = function(resource, options) {
+            const url = new URL(resource, window.location.href);
+            if (url.origin === window.location.origin) {
+                const file = findFile(url.pathname);
+                if (file) {
+                    // Determine content type based on file extension
+                    let contentType = 'text/plain';
+                    if (file.path.endsWith('.js')) {
+                        contentType = 'application/javascript';
+                    } else if (file.path.endsWith('.css')) {
+                        contentType = 'text/css';
+                    }
+                    const res = new Response(new Blob([file.content], { type: contentType }), { status: 200, headers: { 'Content-Type': contentType } });
+                    return Promise.resolve(res);
+                }
+            }
+            return originalFetch.apply(this, arguments);
+        };
+      <\/script>
+    `;
+  
+    // We construct the document, inject our script into the head, and then place the body content.
+    const finalHtml = entryHtml.replace('</head>', `${injectionScript}</head>`);
+    return finalHtml;
+  };
+
+
   const saveToHistory = async (projectData: Omit<Project, 'id' | 'userId' | 'createdAt'>): Promise<string | undefined> => {
     if (!projectsCollection || !user) return;
     try {
@@ -142,7 +232,12 @@ export default function Home() {
     setWebsiteName(project.name);
     setPrompt(project.prompt);
     setGeneratedFiles(project.files);
-    setWebsiteContent(project.previewContent);
+
+    const previewSrc = getPreviewSrcDoc(project.previewFiles, project.previewEntry);
+    setWebsiteContent(previewSrc);
+    setPreviewFiles(project.previewFiles);
+    setPreviewEntry(project.previewEntry);
+
     setCurrentProjectId(project.id);
     storeFilesForIDE(project.files, project.name);
     toast({ title: "Project Loaded", description: `Loaded "${project.name}" from history.` });
@@ -192,29 +287,34 @@ export default function Home() {
 
     const previewResult = await generateWebsitePreviewAction({ prompt, logoDataUri: logoDataUri ?? undefined, theme });
 
-    if (previewResult.error) {
-      toast({ title: 'Preview Generation Failed', description: previewResult.error, variant: 'destructive' });
+    if (previewResult.error || !previewResult.preview) {
+      toast({ title: 'Preview Generation Failed', description: previewResult.error || 'No preview was generated.', variant: 'destructive' });
       setLoading(prev => ({ ...prev, generate: false }));
       return;
     }
 
-    if (previewResult.previewContent) {
-      setWebsiteContent(previewResult.previewContent);
-      toast({ title: 'Preview Generated!', description: 'Your interactive preview is ready. Now generating full project...' });
+    if (previewResult.preview) {
+        const { files, entry } = previewResult.preview;
+        const srcDoc = getPreviewSrcDoc(files, entry);
+        setWebsiteContent(srcDoc);
+        setPreviewFiles(files);
+        setPreviewEntry(entry);
+        toast({ title: 'Preview Generated!', description: 'Your interactive preview is ready. Now generating full project...' });
     }
 
     const projectResult = await generateFullProjectAction({ prompt, logoDataUri: logoDataUri ?? undefined, theme });
 
     if (projectResult.error) {
       toast({ title: 'Full Project Generation Failed', description: projectResult.error, variant: 'destructive' });
-    } else if (projectResult.files && previewResult.previewContent) {
+    } else if (projectResult.files && previewResult.preview) {
         setGeneratedFiles(projectResult.files);
         storeFilesForIDE(projectResult.files, currentWebsiteName);
         const newProjectId = await saveToHistory({
             name: currentWebsiteName,
             prompt: prompt,
             files: projectResult.files,
-            previewContent: previewResult.previewContent,
+            previewFiles: previewResult.preview.files,
+            previewEntry: previewResult.preview.entry,
         });
         if (newProjectId) {
           setCurrentProjectId(newProjectId);
@@ -336,17 +436,30 @@ export default function Home() {
       return;
     }
     setLoading(prev => ({...prev, regenerate: true}));
-    const result = await regenerateSectionAction(websiteContent, regenerateInstructions);
-    if(result.error) {
-      toast({ title: 'Regeneration Failed', description: result.error, variant: 'destructive' });
-    } else if (result.content) {
-      setWebsiteContent(result.content);
+    
+    // For a multi-file preview, we can't just regenerate a section of one file.
+    // A better approach is to re-run the preview generation with modified instructions.
+    // This is a placeholder for a more sophisticated regeneration logic.
+    const modifiedPrompt = `${prompt}. PLEASE APPLY THE FOLLOWING CHANGES: ${regenerateInstructions}`;
+
+    const previewResult = await generateWebsitePreviewAction({ prompt: modifiedPrompt, logoDataUri: logoDataUri ?? undefined });
+
+    if(previewResult.error || !previewResult.preview) {
+      toast({ title: 'Regeneration Failed', description: previewResult.error || "Could not regenerate preview", variant: 'destructive' });
+    } else if (previewResult.preview) {
+      const { files, entry } = previewResult.preview;
+      const srcDoc = getPreviewSrcDoc(files, entry);
+      setWebsiteContent(srcDoc);
+      setPreviewFiles(files);
+      setPreviewEntry(entry);
+      
       // Update history if a project is loaded
       if (currentProjectId && user && firestore) {
         try {
           const projectRef = doc(firestore, 'users', user.uid, 'projects', currentProjectId);
           await updateDoc(projectRef, {
-            previewContent: result.content
+            previewFiles: files,
+            previewEntry: entry,
           });
           toast({ title: 'Preview Updated & Saved!', description: `Your changes have been saved to the project history.` });
 
@@ -381,6 +494,7 @@ export default function Home() {
     setWebsiteName('');
     setLogoDataUri(null);
     setCurrentProjectId(null);
+    setPreviewFiles([]);
     storeFilesForIDE([], '');
   };
   
@@ -692,7 +806,7 @@ export default function Home() {
                 key={previewKey}
                 srcDoc={websiteContent}
                 className="w-full h-full border-0"
-                sandbox="allow-scripts allow-same-origin"
+                sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
                 title="Website Preview"
             />
             </CardContent>
@@ -702,7 +816,3 @@ export default function Home() {
     </TooltipProvider>
   );
 }
-
-
-
-    
