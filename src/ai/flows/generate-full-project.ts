@@ -129,7 +129,7 @@ const generateFullProjectPrompt = ai.definePrompt({
       npm run dev
       \`\`\`
   3.  Open [http://localhost:3000](http://localhost:3000) in your browser to see your website!
-  
+
   ---
   
   ## Step 4: Deployment to Vercel (or other hosts)
@@ -166,7 +166,7 @@ const generateFullProjectPrompt = ai.definePrompt({
 
   STRICT RULES — MUST FOLLOW EXACTLY:
   1.  **Tech Stack:** Use Next.js with the App Router, TypeScript, Tailwind CSS, and Firebase for the backend (Auth and Firestore).
-  2.  **Output Format:** You must output a JSON object that strictly conforms to the output schema. The JSON object should contain a single key, "files", which is an array of objects. Each object in the array represents a file and must have two keys: "path" (the full file path) and "content" (the entire file's code).
+  2.  **Output Format:** You must output a JSON object that strictly conforms to the output schema. The JSON object should contain a single key, "files", which is an an array of objects. Each object in the array represents a file and must have two keys: "path" (the full file path) and "content" (the entire file's code).
   3.  **File Structure:** Create a logical and complete file structure for a Next.js project. This includes, but is not limited to:
       - \`README.md\`
       - \`package.json\`
@@ -179,8 +179,24 @@ const generateFullProjectPrompt = ai.definePrompt({
       - \`src/components/ui/...\` (for any ShadCN components)
       - \`src/lib/firebase.ts\` (for Firebase configuration)
       - \`src/app/api/...\` (for any API routes)
-  4.  **No Extra Commentary:** Do NOT include any extra explanation, commentary, or markdown formatting in your output. The output must be ONLY the valid JSON object.
-  `,
+  4.  **CRITICAL CSS IMPORT:** The root layout file at \`src/app/layout.tsx\` **MUST** import the global stylesheet. The very first line of the file after any 'use client' directive must be: \`import './globals.css';\`. This is non-negotiable.
+  5.  **No Extra Commentary:** Do NOT include any extra explanation, commentary, or markdown formatting in your output. The output must be ONLY the valid JSON object.
+  
+
+  *** DOMAIN-SPECIFIC GUIDELINES ***
+
+  **E-commerce Website Guidelines:**
+  If the user requests an e-commerce website, you MUST implement the following features as a foundation:
+  - **Data Models:** Define clear data structures in Firestore. Create a \`/products\` collection to store product information (name, description, price, image URL).
+  - **Product Listing Page:** Create a main page at \`/products\` that fetches all documents from the \`/products\` collection and displays them in a grid using a reusable \`ProductCard\` component.
+  - **Product Detail Page:** Create a dynamic route at \`/products/[id]\` that displays the details for a single product.
+  - **Shopping Cart:**
+    - When a user signs up, create a \`cart\` subcollection for them at \`/users/{userId}/cart\`.
+    - Implement an "Add to Cart" button on product pages. Clicking this button adds a document to the user's cart subcollection, containing the \`productId\` and \`quantity\`.
+    - Create a \`/cart\` page that displays the items in the current user's cart, calculates the total price, and has a "Checkout" button (this can be a placeholder and does not need to process payments).
+  - **Authentication:** All core e-commerce features (cart, profile) must be protected. Redirect users to the login page if they try to access them without being authenticated.
+  - **Placeholder Images:** Use high-quality placeholder images for products from \`https://picsum.photos/\`.
+`,
 });
 
 const generateFullProjectFlow = ai.defineFlow(
