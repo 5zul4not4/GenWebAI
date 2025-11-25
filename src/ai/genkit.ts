@@ -8,7 +8,7 @@ config();
 export const ai = genkit({
   plugins: [
     openAI({
-      apiKey: process.env.OPENAI_API_KEY,
+      apiKey: process.env.OPENAI_API_KEY2,
     }),
   ],
   model: currentModel,
