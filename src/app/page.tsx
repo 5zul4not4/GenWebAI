@@ -899,9 +899,17 @@ export default function Home() {
             </CardContent>
         </Card>
       </main>
-      <footer className="text-center p-4 text-xs text-muted-foreground fixed bottom-0 right-4">
-            <a href="https://9000-firebase-studio-1763035257048.cluster-osvg2nzmmzhzqqjio6oojllbg4.cloudworkstations.dev"> Using model: {currentModel} </a>
-      </footer>
+<footer className="text-center p-4 text-xs text-muted-foreground fixed bottom-0 right-4">
+  <a
+    href="https://9000-firebase-studio-1763035257048.cluster-osvg2nzmmzhzqqjio6oojllbg4.cloudworkstations.dev"
+    target="_blank"
+    rel="noopener noreferrer"
+    className="hover:underline cursor-pointer"
+  >
+    Using model: {currentModel}
+  </a>
+</footer>
+
     </div>
     </TooltipProvider>
   );
