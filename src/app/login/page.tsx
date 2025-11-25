@@ -1,4 +1,3 @@
-
 'use client';
 
 import { useState, FormEvent, useEffect } from 'react';
@@ -9,10 +8,9 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { useToast } from '@/hooks/use-toast';
-import {
-  signInWithEmailAndPassword,
-} from 'firebase/auth';
-import { useAuth, useUser } from '@/firebase';
+import { signInWithEmailAndPassword, GoogleAuthProvider, signInWithRedirect } from 'firebase/auth';
+import { useAuth } from '@/firebase';
+import { useUser } from '@/firebase/useUser';
 import { LoaderCircle, LogIn } from 'lucide-react';
 import { AppLogo } from '@/components/icons';
 import { ThemeToggle } from '@/components/theme-toggle';
@@ -21,14 +19,13 @@ export default function LoginPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
-  
+
   const router = useRouter();
   const { toast } = useToast();
   const auth = useAuth();
   const { user, isUserLoading } = useUser();
 
-
-  // This effect redirects the user if they are logged in.
+  // Redirect only after auth is ready
   useEffect(() => {
     if (!isUserLoading && user) {
       router.push('/');
@@ -41,10 +38,10 @@ export default function LoginPage() {
       toast({ title: 'Missing fields', description: 'Please enter both email and password.', variant: 'destructive' });
       return;
     }
+
     setIsSubmitting(true);
     try {
       await signInWithEmailAndPassword(auth, email, password);
-      // Let the useEffect handle the redirect after toast
       toast({ title: 'Login Successful', description: 'Welcome back!' });
     } catch (error: any) {
       toast({ title: 'Login Failed', description: error.message, variant: 'destructive' });
@@ -53,8 +50,13 @@ export default function LoginPage() {
     }
   };
 
-  // Show a full-page loader while checking for user state.
-  if (isUserLoading || user) {
+  const handleGoogleLogin = () => {
+    const provider = new GoogleAuthProvider();
+    signInWithRedirect(auth, provider);
+  };
+
+  // Show loader **only while loading**, not when user=null
+  if (isUserLoading) {
     return (
       <div className="flex h-screen w-full items-center justify-center">
         <LoaderCircle className="h-8 w-8 animate-spin text-primary" />
@@ -75,6 +77,7 @@ export default function LoginPage() {
           <CardTitle className="font-headline text-2xl">Welcome Back</CardTitle>
           <CardDescription>Sign in to continue to GenWebAI</CardDescription>
         </CardHeader>
+
         <CardContent>
           <form onSubmit={handleEmailLogin} className="space-y-4">
             <div className="space-y-2">
@@ -89,31 +92,40 @@ export default function LoginPage() {
                 disabled={isSubmitting}
               />
             </div>
+
             <div className="space-y-2">
-               <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between">
                 <Label htmlFor="password">Password</Label>
-                 <Link href="/forgot-password" passHref>
-                    <span className="text-xs text-primary hover:underline cursor-pointer">Forgot password?</span>
+                <Link href="/forgot-password">
+                  <span className="text-xs text-primary hover:underline cursor-pointer">(Forgot?)</span>
                 </Link>
               </div>
-              <Input 
-                id="password" 
-                type="password" 
-                required 
+              <Input
+                id="password"
+                type="password"
+                required
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 disabled={isSubmitting}
               />
             </div>
+
             <Button type="submit" className="w-full" disabled={isSubmitting}>
               {isSubmitting ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <LogIn className="mr-2 h-4 w-4" />}
               Sign In
             </Button>
           </form>
+
+          <div className="my-4 text-center text-xs">OR CONTINUE WITH</div>
+
+          <Button className="w-full bg-blue-500 text-white" onClick={handleGoogleLogin}>
+            Continue with Google
+          </Button>
         </CardContent>
+
         <CardFooter className="text-center text-sm justify-center">
           Don&apos;t have an account?&nbsp;
-          <Link href="/signup" passHref>
+          <Link href="/signup">
             <span className="text-primary hover:underline cursor-pointer">Sign up</span>
           </Link>
         </CardFooter>
